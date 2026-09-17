@@ -150,6 +150,16 @@ class FakeElement {
     return this.attributes.get(name) || "";
   }
 
+  hasAttribute(name) {
+    return this.attributes.has(name);
+  }
+
+  removeAttribute(name) {
+    this.attributes.delete(name);
+    if (name === "data") this.data = "";
+    if (name === "src") this.src = "";
+  }
+
   appendChild(child) {
     child.parentNode = this;
     child.offsetParent = this;
@@ -548,6 +558,46 @@ describe("renderer directional drag reactions (#620)", () => {
     assert.strictEqual(harness.api.currentDisplayedSvg, "codex-pet-idle-loop.svg");
     assert.strictEqual(attached.root.getAttribute("data-clawd-codex-pet-visual"), "idle-loop");
     assert.strictEqual(harness.mediaLayer.querySelectorAll("object.clawd-object, img.clawd-img").length, 1);
+  });
+
+  it("clears data-clawd-drag-direction when the drag ends", () => {
+    const harness = makeUniversalCodexPetHarness();
+    const attached = commitUniversalCodexPet(
+      harness,
+      "codex-pet-idle-loop.svg",
+      "idle-loop"
+    );
+
+    harness.electronHandlers.onStartDragReaction("right");
+    assert.strictEqual(attached.root.getAttribute("data-clawd-drag-direction"), "right");
+
+    harness.electronHandlers.onEndDragReaction();
+    assert.strictEqual(
+      attached.root.hasAttribute("data-clawd-drag-direction"),
+      false,
+      "the direction attribute must not outlive the drag: the document is reused, so a stale " +
+        "value keeps feeding direction-dependent CSS and the accessory mirror after release"
+    );
+
+    harness.electronHandlers.onStateChange("idle", "codex-pet-idle-loop.svg");
+    assert.strictEqual(attached.root.hasAttribute("data-clawd-drag-direction"), false);
+    assert.strictEqual(attached.root.getAttribute("data-clawd-codex-pet-visual"), "idle-loop");
+  });
+
+  it("leaves the directional marker in place so the next drag can reuse the bridge", () => {
+    const harness = makeUniversalCodexPetHarness();
+    const attached = commitUniversalCodexPet(
+      harness,
+      "codex-pet-idle-loop.svg",
+      "idle-loop"
+    );
+
+    harness.electronHandlers.onStartDragReaction("left");
+    harness.electronHandlers.onEndDragReaction();
+    assert.strictEqual(attached.root.getAttribute("data-clawd-drag-directional"), "v1");
+
+    harness.electronHandlers.onStartDragReaction("right");
+    assert.strictEqual(attached.root.getAttribute("data-clawd-drag-direction"), "right");
   });
 
   it("restarts an already selected universal one-shot without replacing its object", () => {

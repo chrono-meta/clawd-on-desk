@@ -1588,6 +1588,20 @@ function applyDirectionalDragToObject(objectEl, direction, options = {}) {
   }
 }
 
+function clearDirectionalDragFromObject(objectEl) {
+  if (!objectEl || objectEl.tagName !== "OBJECT") return false;
+  try {
+    const root = objectEl.contentDocument && objectEl.contentDocument.documentElement;
+    if (!root || !root.hasAttribute("data-clawd-drag-direction")) return false;
+    // Only the direction is cleared. "data-clawd-drag-directional" is the document's
+    // capability marker rather than drag state, so it must survive for the next drag.
+    root.removeAttribute("data-clawd-drag-direction");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function getCodexPetVisualForFile(file) {
   if (!file) return null;
   const basename = String(file).replace(/\\/g, "/").split("/").pop().split(/[?#]/, 1)[0];
@@ -1712,6 +1726,10 @@ function endDragReaction() {
   isDragReacting = false;
   currentDragSvg = null;
   currentDragDirection = null;
+  // The universal Codex Pet wrapper keeps ONE document across drag/release/state changes,
+  // so clearing the JS variable is not enough: the stale attribute keeps feeding
+  // direction-dependent CSS and pet-accessory-mirror after the drag is over.
+  clearDirectionalDragFromObject(clawdEl);
   if (!wasDragReacting) return;
   window.electronAPI.resumeFromReaction();
 }
