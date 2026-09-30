@@ -622,28 +622,20 @@ describe("destructive reminder — shell context decides whether a word is a com
     );
   });
 
-  it("KNOWN MISS: a heredoc body is read as command positions", () => {
-    // A heredoc body is DATA, so `rm -rf` inside one is text being written to a
-    // file. This splitter reports it as a command anyway. The class is
-    // pre-existing -- `;` produced the same false hold before a lone `&` was
-    // added to the separator set -- and the direction is a false HOLD, which
-    // costs a human glance rather than an unreviewed deletion.
-    //
-    // A skip was written and REVERTED. It traded this cheap failure for three
-    // expensive ones, all measured: a `;` on the opener's own line was
-    // swallowed, `<<E'OF'` parsed the delimiter as `E`, and `$((1<<2))` read an
-    // arithmetic left-shift as a heredoc opener -- each hiding a command the
-    // shell runs. These lanes pin the current behaviour so that a future skip
-    // has to come back through them.
+  it("KNOWN FALSE HOLD: a heredoc body outside a commit or PR message is read as shell", () => {
+    // A heredoc body is DATA to `cat`, but only one message shape is
+    // recognised (see the next tests). Every other heredoc keeps the old,
+    // conservative reading, which errs toward a false HOLD.
     for (const command of [
       "cat <<'EOF'\necho safe & rm -rf ./data\nEOF",
       "cat <<'EOF'\necho safe; rm -rf /\nEOF",
+      "cat <<EOF\nit's fine\nEOF",
     ]) {
       const verdict = evaluatePermissionReminder("Bash", { command });
       assert.equal(verdict && verdict.hold, true, command);
     }
-    // The three inputs the reverted skip got wrong. They are ordinary shell and
-    // the shell really does run the delete, so they must hold.
+    // The three inputs an earlier, reverted skip got wrong. They are ordinary
+    // shell and the shell really does run the delete, so they must hold.
     for (const command of [
       "cat <<'EOF' ; rm -rf ./data",
       "cat <<E'OF'\nharmless\nEOF\nrm -rf ./data\nE",
@@ -654,6 +646,107 @@ describe("destructive reminder — shell context decides whether a word is a com
         { hold: true, tag: "file-delete" },
         command
       );
+    }
+  });
+
+  it("a commit or PR message heredoc is data", () => {
+    // Quoted delimiter: nothing in the body expands or runs.
+    for (const command of [
+      "git commit -m \"$(cat <<'EOF'\nrm -rf /\ngit push --force\nEOF\n)\"",
+      "git commit -m \"$(cat <<'EOF'\n$(rm -rf /)\nEOF\n)\"",
+    ]) {
+      assert.equal(evaluatePermissionReminder("Bash", { command }), null, command);
+    }
+  });
+
+  it("a message heredoc gets the same verdict as the same quoted -m message", () => {
+    // Message text was never scanned in a quoted -m value; the heredoc form now
+    // matches it instead of being held by accident.
+    for (const [heredoc, plain] of [
+      [
+        "git commit -m \"$(cat <<'EOF'\nrm -rf ./victim\nEOF\n)\"",
+        "git commit -m \"rm -rf ./victim\"",
+      ],
+      [
+        "git merge --no-verify -m \"$(cat <<'EOF'\nrm -rf ./victim\nEOF\n)\" topic",
+        "git merge --no-verify -m \"rm -rf ./victim\" topic",
+      ],
+    ]) {
+      assert.equal(evaluatePermissionReminder("Bash", { command: plain }), null, plain);
+      assert.deepEqual(
+        evaluatePermissionReminder("Bash", { command: heredoc }),
+        evaluatePermissionReminder("Bash", { command: plain }),
+        heredoc
+      );
+    }
+  });
+
+  it("shell around a message heredoc is still read as shell", () => {
+    for (const command of [
+      "git commit -m \"$(cat <<'EOF'\nmsg\nEOF\n)\" && rm -rf /",
+      "git commit -m \"$(cat <<'EOF'\nit's\nEOF\n)\"\nrm -rf /",
+      "git commit -m \"$(cat <<'EOF'\nbody\n  EOF\nEOF\n)\"; rm -rf /",
+      "rm -rf / && git commit -m \"$(cat <<'EOF'\nit's\nEOF\n)\"",
+    ]) {
+      const verdict = evaluatePermissionReminder("Bash", { command });
+      assert.equal(verdict && verdict.hold, true, command);
+    }
+  });
+
+  it("a heredoc body that can run is still scanned", () => {
+    for (const command of [
+      // Fed to an interpreter.
+      "bash <<'EOF'\nrm -rf ~\nEOF",
+      "sh -s <<'EOF'\nrm -rf ~\nEOF",
+      "sudo bash <<'EOF'\nrm -rf /\nEOF",
+      // The output reaches a shell.
+      "cat <<'EOF' | sh\nrm -rf /\nEOF",
+      "{ echo; cat <<'EOF'\nrm -rf /\nEOF\n} | sh",
+      "bash -c \"$(cat <<'EOF'\nrm -rf /\nEOF\n)\"",
+      "eval \"$(cat <<'EOF'\nrm -rf /\nEOF\n)\"",
+      "$(cat <<'EOF'\nrm -rf /\nEOF\n)",
+      "git log -1 --format=\"$(cat <<'EOF'\nrm -rf /\nEOF\n)\" | sh",
+      "git commit -m \"$(cat <<'EOF'\nrm -rf /\nEOF\n)\" | sh",
+      "{ git commit -m \"$(cat <<'EOF'\nrm -rf /\nEOF\n)\"; } | sh",
+      // Not a message: a `!` alias, a configured alias, or a `-c` value that
+      // git runs as a command.
+      "git -c alias.x='!sh -c \"$1\" -' x \"$(cat <<'EOF'\nrm -rf src\nEOF\n)\"",
+      "git -c core.sshCommand=\"$(cat <<'EOF'\nsh -c 'rm -rf src'\nEOF\n)\" ls-remote git@github.com:owner/repo.git",
+      "git x \"$(cat <<'EOF'\nrm -rf src\nEOF\n)\"",
+      "git -c core.hooksPath=h commit -m \"$(cat <<'EOF'\nrm -rf src\nEOF\n)\"",
+      "gh api repos/o/r -f body=\"$(cat <<'EOF'\nrm -rf src\nEOF\n)\"",
+      // Writes a file. A git hook runs during the very commit.
+      "git commit -m \"$(tee .git/hooks/prepare-commit-msg <<EOF\n#!/bin/sh\nrm -rf ./victim\nEOF\n)\"",
+      "git commit -m \"$(tee .git/hooks/post-commit <<EOF\n#!/bin/sh\nrm -rf ./victim\nEOF\n)\"",
+      "mkdir -p .git/hooks && : > .git/hooks/pre-merge-commit && chmod +x .git/hooks/pre-merge-commit && git merge -m \"$(tee .git/hooks/pre-merge-commit <<EOF\n#!/bin/sh\nrm -rf ./victim\nEOF\n)\" topic",
+      "git commit -m \"$(cat > x <<'EOF'\nrm -rf ./victim\nEOF\n)\"",
+      "cat <<'EOF' > .git/hooks/pre-commit\n#!/bin/sh\nrm -rf ./victim\nEOF",
+      "cat > x.sh <<'EOF'\nrm -rf ./victim\nEOF\nbash x.sh",
+      "cat > x.sh <<'EOF'\nrm -rf ./victim\nEOF\n./x.sh",
+      "tee x.sh <<'EOF'\nrm -rf ./victim\nEOF\nsudo bash x.sh",
+      // An unquoted delimiter expands `$( … )` in the body.
+      "git commit -m \"$(cat <<EOF\nit's $(rm -rf /)\nEOF\n)\"",
+    ]) {
+      const verdict = evaluatePermissionReminder("Bash", { command });
+      assert.equal(verdict && verdict.hold, true, command);
+    }
+    assert.deepEqual(
+      evaluatePermissionReminder("Bash", { command: "ssh h <<EOF\ngit push --force\nEOF" }),
+      { hold: true, tag: "force-push" }
+    );
+  });
+
+  it("a message heredoc the scan cannot place is read the old way", () => {
+    for (const command of [
+      "git commit -m \"$(cat <<'EOF'\nunterminated\nrm -rf /",
+      "git commit -m \"$(cat <<'EOF'\nit's\nEOF)\"\nrm -rf /",
+      "echo ${x//<<EOF/y}\nrm -rf /\nEOF",
+      "echo $[1<<2 ]\nrm -rf /\n2",
+      "for ((i=0;i<<2;i++)); do :; done\nrm -rf /\n2",
+      "cat <<'X'\nit's\nX\ngit commit -m \"$(cat <<'EOF'\nmsg\nEOF\n)\" && rm -rf /",
+    ]) {
+      const verdict = evaluatePermissionReminder("Bash", { command });
+      assert.equal(verdict && verdict.hold, true, command);
     }
   });
 
@@ -880,12 +973,44 @@ describe("destructive reminder — known misses at the inspection budget", () =>
     );
   });
 
-  it("KNOWN FALSE HOLD: heredoc bodies are not parsed as data", () => {
+  it("a commit or PR message heredoc is not a scan error", () => {
+    // v1.2.0 known limitation: an odd apostrophe, `(#N)`, or a lone backtick or
+    // double quote in the body held these as scan-error.
+    for (const command of [
+      "git commit -m \"$(cat <<'EOF'\nfix: don't break (#123)\nEOF\n)\"",
+      "git commit -m \"$(cat <<'EOF'\nsee (#1021) and `x \"\nEOF\n)\" && git push",
+      "git commit -am \"$(cat <<'EOF'\nit's\nEOF\n)\"",
+      "git commit --message=\"$(cat <<'EOF'\nit's\nEOF\n)\"",
+      "git tag -a v1 -m \"$(cat <<'EOF'\nit's\nEOF\n)\"",
+      "gh pr create --title t --body \"$(cat <<'EOF'\nCloses (#42) — it's fine\nEOF\n)\"",
+      "gh pr comment 1 -b \"$(cat <<'EOF'\nit's\nEOF\n)\"",
+      "gh release create v1 --notes \"$(cat <<'EOF'\nit's\nEOF\n)\"",
+    ]) {
+      assert.equal(evaluatePermissionReminder("Bash", { command }), null, command);
+    }
+    // The rest of the request is still read: the message does not excuse it.
     assert.deepEqual(
-      evaluatePermissionReminder("Bash", { command: "cat <<EOF\nit's fine\nEOF" }),
-      { hold: true, tag: SCAN_ERROR_TAG },
-      "heredoc parsing remains outside this repair's shell-scanner scope"
+      evaluatePermissionReminder("Bash", {
+        command: "git commit -m \"$(cat <<'EOF'\nfix: don't break (#123)\nEOF\n)\" && git push --force",
+      }),
+      { hold: true, tag: "force-push" }
     );
+  });
+
+  it("KNOWN FALSE HOLD: a heredoc outside the recognised message shape is still read as shell", () => {
+    for (const command of [
+      "cat <<'EOF' > notes.md\nIt's done\nEOF",
+      "git commit -F - <<'EOF'\nit's\nEOF",
+      "MSG=\"$(cat <<'EOF'\nit's\nEOF\n)\"",
+      "git -C repo commit -m \"$(cat <<'EOF'\nit's\nEOF\n)\"",
+      "git commit -m \"$(cat <<EOF\nit's\nEOF\n)\"",
+    ]) {
+      assert.deepEqual(
+        evaluatePermissionReminder("Bash", { command }),
+        { hold: true, tag: SCAN_ERROR_TAG },
+        command
+      );
+    }
   });
 
   it("KNOWN MISS: a destructive command past the scan cap is not reached", () => {
