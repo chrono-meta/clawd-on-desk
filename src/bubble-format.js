@@ -808,6 +808,13 @@
         const line = cmd.slice(pos, nl);
         pos = nl + 1;
         if (line === opener[1]) break;
+        // bash 3.2 (macOS /bin/bash and /bin/sh) joins a body line that ends in
+        // a backslash to the next one even under a quoted delimiter, so `E\`
+        // then `OF` ends the heredoc early and the lines after it run. zsh and
+        // bash 5 keep it literal. Where the body ends depends on the shell, so
+        // read the command the old way. Any trailing backslash gives up, without
+        // counting them: the cost is a false hold, not a missed one.
+        if (line.endsWith("\\")) giveUp();
       }
       const close = /^[ \t\n]*\)/.exec(cmd.slice(pos));
       if (!close) giveUp();

@@ -25,7 +25,9 @@
 
 const { describe, it } = require("node:test");
 const assert = require("node:assert/strict");
+const { spawnSync } = require("node:child_process");
 const fs = require("node:fs");
+const os = require("node:os");
 const path = require("node:path");
 
 const {
@@ -747,6 +749,90 @@ describe("destructive reminder — shell context decides whether a word is a com
     ]) {
       const verdict = evaluatePermissionReminder("Bash", { command });
       assert.equal(verdict && verdict.hold, true, command);
+    }
+  });
+
+  // bash 3.2 (macOS /bin/bash and /bin/sh) joins a heredoc body line that ends
+  // in a backslash to the next one even when the delimiter is quoted, so `E\`
+  // and `OF` end the heredoc and the lines after it run. zsh and bash 5 keep
+  // them as text. Which line ends the body depends on the shell, so a message
+  // with such a line is read the old way.
+  const messageWithBody = (body) => "git commit -m \"$(cat <<'EOF'\n" + body + "\nEOF\n)\"";
+  const BACKSLASH_BODIES = [
+    "E\\\nOF\nrm -rf ./victim",      // the reported case
+    "EO\\\nF\nrm -rf ./victim",      // joined at another point
+    "EOF\\\n\nrm -rf ./victim",      // the delimiter text itself ends in one
+    "x\\\nEOF\nrm -rf ./victim",     // last line before the delimiter: bash 3.2 reads past it, bash 5 does not
+    "E\\\\\nOF\nrm -rf ./victim",    // two backslashes stay literal in the shells tried, but the count is not trusted
+  ];
+
+  it("a message body line ending in a backslash is read the old way", () => {
+    for (const body of BACKSLASH_BODIES) {
+      assert.deepEqual(
+        evaluatePermissionReminder("Bash", { command: messageWithBody(body) }),
+        { hold: true, tag: "file-delete" },
+        body
+      );
+    }
+    // A backslash anywhere else in a line is still message text.
+    for (const body of ["fix: don't break (#123)", "path C:\\temp\\new is fine"]) {
+      assert.equal(evaluatePermissionReminder("Bash", { command: messageWithBody(body) }), null, body);
+    }
+  });
+
+  // The same commands in a real shell, with `git` and `rm` replaced by
+  // functions so nothing is committed or removed.
+  const SHELL_FAKES = "git() { :; }\nrm() { printf 'rm-ran\\n' >&2; }\n";
+  const shellRunsRm = (shell, command, cwd) => {
+    const result = spawnSync(shell, ["-c", SHELL_FAKES + command], {
+      cwd,
+      encoding: "utf8",
+      env: { PATH: process.env.PATH },
+      timeout: 10000,
+    });
+    return (result.stderr || "").includes("rm-ran");
+  };
+  const POSIX_SHELLS = process.platform === "win32"
+    ? []
+    : ["/bin/bash", "/bin/sh", "/bin/zsh", "/bin/dash"].filter((shell) => fs.existsSync(shell));
+  const BASH3_SHELLS = POSIX_SHELLS.filter((shell) => {
+    const result = spawnSync(shell, ["-c", "printf %s \"$BASH_VERSION\""], { encoding: "utf8", timeout: 10000 });
+    return result.status === 0 && /^3\./.test(result.stdout);
+  });
+
+  it("bash 3.2 runs what follows a joined delimiter, and the reminder holds it", {
+    skip: BASH3_SHELLS.length ? false : "needs bash 3.x at /bin/bash or /bin/sh (macOS)",
+  }, () => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "clawd-heredoc-"));
+    try {
+      const joined = messageWithBody(BACKSLASH_BODIES[0]);
+      const plain = messageWithBody("fix: don't break (#123)\nrm -rf ./victim");
+      for (const shell of BASH3_SHELLS) {
+        assert.equal(shellRunsRm(shell, joined, cwd), true, `${shell} ends the heredoc at E\\ + OF`);
+        // Control: without the backslash the rm line stays message text.
+        assert.equal(shellRunsRm(shell, plain, cwd), false, shell);
+      }
+      assert.deepEqual(evaluatePermissionReminder("Bash", { command: joined }), { hold: true, tag: "file-delete" });
+      assert.equal(evaluatePermissionReminder("Bash", { command: plain }), null);
+    } finally {
+      fs.rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("whenever a shell here runs the rm in a backslash body, the reminder holds it", {
+    skip: POSIX_SHELLS.length ? false : "needs a POSIX shell",
+  }, () => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "clawd-heredoc-"));
+    try {
+      for (const body of BACKSLASH_BODIES) {
+        const command = messageWithBody(body);
+        const verdict = evaluatePermissionReminder("Bash", { command });
+        for (const shell of POSIX_SHELLS) {
+          if (shellRunsRm(shell, command, cwd)) assert.equal(verdict && verdict.hold, true, `${shell}: ${body}`);
+        }
+      }
+    } finally {
+      fs.rmSync(cwd, { recursive: true, force: true });
     }
   });
 
