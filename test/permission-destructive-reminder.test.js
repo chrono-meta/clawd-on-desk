@@ -783,11 +783,11 @@ describe("destructive reminder — shell context decides whether a word is a com
   // The same commands in a real shell, with `git` and `rm` replaced by
   // functions so nothing is committed or removed.
   const SHELL_FAKES = "git() { :; }\nrm() { printf 'rm-ran\\n' >&2; }\n";
-  const shellRunsRm = (shell, command, cwd) => {
+  const shellRunsRm = (shell, command, cwd, env) => {
     const result = spawnSync(shell, ["-c", SHELL_FAKES + command], {
       cwd,
       encoding: "utf8",
-      env: { PATH: process.env.PATH },
+      env: { PATH: process.env.PATH, ...env },
       timeout: 10000,
     });
     return (result.stderr || "").includes("rm-ran");
@@ -820,16 +820,26 @@ describe("destructive reminder — shell context decides whether a word is a com
   });
 
   it("whenever a shell here runs the rm in a backslash body, the reminder holds it", {
-    skip: POSIX_SHELLS.length ? false : "needs a POSIX shell",
+    skip: BASH3_SHELLS.length
+      ? false
+      : "needs bash 3.x: bash 5, zsh and dash keep these bodies as text, so nothing would be checked",
   }, () => {
     const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "clawd-heredoc-"));
     try {
+      const fired = new Set();
       for (const body of BACKSLASH_BODIES) {
         const command = messageWithBody(body);
         const verdict = evaluatePermissionReminder("Bash", { command });
         for (const shell of POSIX_SHELLS) {
-          if (shellRunsRm(shell, command, cwd)) assert.equal(verdict && verdict.hold, true, `${shell}: ${body}`);
+          if (!shellRunsRm(shell, command, cwd)) continue;
+          fired.add(shell + "|" + body);
+          assert.equal(verdict && verdict.hold, true, `${shell}: ${body}`);
         }
+      }
+      // An empty run would pass without checking anything: bash 3.x is known
+      // to run the reported body, so at least that pair must have been checked.
+      for (const shell of BASH3_SHELLS) {
+        assert.ok(fired.has(shell + "|" + BACKSLASH_BODIES[0]), `${shell} did not run the reported body`);
       }
     } finally {
       fs.rmSync(cwd, { recursive: true, force: true });
@@ -842,12 +852,11 @@ describe("destructive reminder — shell context decides whether a word is a com
   // in the text it is given, so `a[$(rm …)]` in the body runs.
   const messageAround = (open, close, body) =>
     "git commit -m \"" + open + "$(cat <<'EOF'\n" + body + "\nEOF\n)" + close + "\"";
-  const EVALUATING_WRAPPERS = [
+  // Caught by the `$ … [` check in skipDouble().
+  const SUBSCRIPT_WRAPPERS = [
     ["$[", "]"],         // bash, sh, zsh (reported)
     ["$[ 1 + ", " ]"],
     ["x $[", "] y"],
-    ["$((", "))"],
-    ["${a[", "]}"],
     ["$a[", "]"],        // zsh subscripts from here down
     ["$PWD[", "]"],
     ["$#a[", "]"],
@@ -856,12 +865,33 @@ describe("destructive reminder — shell context decides whether a word is a com
     ["$@[", "]"],
     ["$$[", "]"],
     ["$" + "v".repeat(80) + "[", "]"], // a long name
+    ["$日本語[", "]"],   // zsh in a UTF-8 locale: a name is not only ASCII
+    ["$변수[", "]"],
+    ["$é[", "]"],
+  ];
+  // These gave up before that check existed: substitution() gives up on a
+  // `$(( … ))` that contains `<<`, and skipParam() on a `${ … }` that contains
+  // `$`. Kept here so a change to either is measured against the same shells.
+  const ALREADY_GIVEN_UP_WRAPPERS = [
+    ["$((", "))"],
+    ["${a[", "]}"],
   ];
   // zsh only evaluates a subscript of a variable that is set, hence PATH.
   const SUBSCRIPT_BODIES = ["a[$(rm -rf ./victim)]", "a[`rm -rf ./victim`]", "PATH[$(rm -rf ./victim)]"];
+  const UTF8_ENV = { LANG: "en_US.UTF-8", LC_ALL: "en_US.UTF-8" };
+  // zsh falls back to single bytes when the locale is missing; check that `é`
+  // is one character before relying on a multibyte name.
+  const ZSH_UTF8 = POSIX_SHELLS.includes("/bin/zsh") && (() => {
+    const result = spawnSync("/bin/zsh", ["-c", "print -r -- ${#${:-é}}"], {
+      encoding: "utf8",
+      env: { PATH: process.env.PATH, ...UTF8_ENV },
+      timeout: 10000,
+    });
+    return result.status === 0 && result.stdout.trim() === "1";
+  })();
 
   it("a message heredoc inside arithmetic or a subscript is read the old way", () => {
-    for (const [open, close] of EVALUATING_WRAPPERS) {
+    for (const [open, close] of SUBSCRIPT_WRAPPERS) {
       for (const body of SUBSCRIPT_BODIES) {
         const command = messageAround(open, close, body);
         assert.deepEqual(evaluatePermissionReminder("Bash", { command }), { hold: true, tag: "file-delete" }, command);
@@ -875,8 +905,17 @@ describe("destructive reminder — shell context decides whether a word is a com
       assert.deepEqual(evaluatePermissionReminder("Bash", { command }), { hold: true, tag: "file-delete" }, command);
     }
     // The same text as a plain message body is still message text.
-    for (const body of [...SUBSCRIPT_BODIES, "fix: don't break (#123)"]) {
+    for (const body of [...SUBSCRIPT_BODIES, "fix: don't break (#123)", "日本語 [note] é"]) {
       assert.equal(evaluatePermissionReminder("Bash", { command: messageWithBody(body) }), null, body);
+    }
+  });
+
+  it("a message heredoc inside $(( )) or ${ } was already read the old way", () => {
+    for (const [open, close] of ALREADY_GIVEN_UP_WRAPPERS) {
+      for (const body of SUBSCRIPT_BODIES) {
+        const command = messageAround(open, close, body);
+        assert.deepEqual(evaluatePermissionReminder("Bash", { command }), { hold: true, tag: "file-delete" }, command);
+      }
     }
   });
 
@@ -912,20 +951,56 @@ describe("destructive reminder — shell context decides whether a word is a com
     }
   });
 
-  it("whenever a shell here runs the rm in arithmetic or a subscript, the reminder holds it", {
-    skip: POSIX_SHELLS.length ? false : "needs a POSIX shell",
+  it("zsh in a UTF-8 locale runs a heredoc's output inside a non-ASCII $name[ ], and the reminder holds it", {
+    skip: ZSH_UTF8 ? false : "needs /bin/zsh with a working en_US.UTF-8 locale",
   }, () => {
     const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "clawd-heredoc-"));
     try {
-      for (const [open, close] of EVALUATING_WRAPPERS) {
+      for (const name of ["日本語", "변수", "é"]) {
+        const command = messageAround("$" + name + "[", "]", "PATH[$(rm -rf ./victim)]");
+        assert.equal(shellRunsRm("/bin/zsh", command, cwd, UTF8_ENV), true, `zsh evaluates $${name}[ ] in UTF-8`);
+        // Control: in the C locale the same bytes are not a name.
+        assert.equal(shellRunsRm("/bin/zsh", command, cwd, { LANG: "C", LC_ALL: "C" }), false, `zsh, C locale: ${name}`);
+        assert.deepEqual(evaluatePermissionReminder("Bash", { command }), { hold: true, tag: "file-delete" }, name);
+      }
+    } finally {
+      fs.rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("whenever a shell here runs the rm in arithmetic or a subscript, the reminder holds it", {
+    skip: BASH3_SHELLS.length || POSIX_SHELLS.includes("/bin/zsh")
+      ? false
+      : "needs bash 3.x or zsh: no other shell here is known to run these forms, so nothing would be checked",
+  }, () => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "clawd-heredoc-"));
+    // Only zsh reads a name differently by locale; the others run once.
+    const envsFor = (shell) => (shell === "/bin/zsh" ? [["default", {}], ["utf8", UTF8_ENV]] : [["default", {}]]);
+    try {
+      const fired = new Set();
+      for (const [open, close] of [...SUBSCRIPT_WRAPPERS, ...ALREADY_GIVEN_UP_WRAPPERS]) {
         for (const body of SUBSCRIPT_BODIES) {
           const command = messageAround(open, close, body);
           const verdict = evaluatePermissionReminder("Bash", { command });
           for (const shell of POSIX_SHELLS) {
-            if (shellRunsRm(shell, command, cwd)) assert.equal(verdict && verdict.hold, true, `${shell}: ${command}`);
+            for (const [envName, env] of envsFor(shell)) {
+              if (!shellRunsRm(shell, command, cwd, env)) continue;
+              fired.add([shell, envName, open, body].join("|"));
+              assert.equal(verdict && verdict.hold, true, `${shell} (${envName}): ${command}`);
+            }
           }
         }
       }
+      // An empty run would pass without checking anything. These pairs are
+      // known to run the rm, so each one present must have been checked.
+      const expected = [];
+      for (const shell of BASH3_SHELLS) expected.push([shell, "default", "$[", SUBSCRIPT_BODIES[0]]);
+      if (POSIX_SHELLS.includes("/bin/zsh")) expected.push(["/bin/zsh", "default", "$PWD[", SUBSCRIPT_BODIES[2]]);
+      if (ZSH_UTF8) expected.push(["/bin/zsh", "utf8", "$日本語[", SUBSCRIPT_BODIES[2]]);
+      for (const pair of expected) {
+        assert.ok(fired.has(pair.join("|")), `expected ${pair[0]} (${pair[1]}) to run the rm in ${pair[2]} … ]`);
+      }
+      assert.ok(fired.size >= expected.length, `checked ${fired.size} runs`);
     } finally {
       fs.rmSync(cwd, { recursive: true, force: true });
     }

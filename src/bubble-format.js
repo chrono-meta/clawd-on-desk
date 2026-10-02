@@ -838,10 +838,14 @@
     // expansion around it evaluates that text again. `$[ … ]` is arithmetic in
     // bash and zsh, and in zsh `$name[ … ]` (also `$#name[`, `$@[`, `$$[` and
     // so on) is a subscript evaluated the same way, so `a[$(rm …)]` in the body
-    // runs. Give up on any `$` that reaches a `[` through a parameter name, as
-    // the top level already does for `$[`. `$(( … ))` and `${ … }` give up in
+    // runs. Give up on any `$` that reaches a `[` with no separator in between,
+    // as the top level already does for `$[`. A name is not limited to ASCII:
+    // in a UTF-8 locale zsh also reads `$日本語[` or `$é[` as a subscript, so
+    // anything that is not whitespace, a quote, `$`, `\`, a brace, a paren or a
+    // bracket counts as part of the name. A `$` inside the run is tested on its
+    // own, which covers `$$[`. `$(( … ))` and `${ … }` give up in
     // substitution() and skipParam().
-    const EVALUATED_SUBSCRIPT = /\$[#+=~^]*(?:[A-Za-z_][A-Za-z0-9_]*|[0-9]+|[*@#?$!-])?\[/y;
+    const EVALUATED_SUBSCRIPT = /\$[^\s"'`$\\{}()[\]]*\[/y;
     const evaluatedSubscriptAt = (i) => {
       EVALUATED_SUBSCRIPT.lastIndex = i;
       return EVALUATED_SUBSCRIPT.test(cmd);
