@@ -854,6 +854,10 @@
     function skipDouble(i) {
       for (i++; i < cmd.length;) {
         const ch = cmd[i];
+        // Inside double quotes the shell drops a backslash-newline, so
+        // `"$PWD\<newline>[` is `$PWD[` to zsh. Rather than rejoin the lines
+        // for the checks below, give up, as for a body line ending in `\`.
+        if (ch === "\\" && cmd[i + 1] === "\n") giveUp();
         if (ch === "\\") i += 2;
         else if (ch === '"') return i + 1;
         else if (ch === "`") i = skipBacktick(i);

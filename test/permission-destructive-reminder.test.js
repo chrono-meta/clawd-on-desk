@@ -790,6 +790,10 @@ describe("destructive reminder — shell context decides whether a word is a com
       env: { PATH: process.env.PATH, ...env },
       timeout: 10000,
     });
+    // A shell that failed to start or timed out says nothing about whether the
+    // command runs; fail loudly instead of reading it as "did not run".
+    if (result.error) throw result.error;
+    if (result.signal) throw new Error(`${shell} was killed by ${result.signal}`);
     return (result.stderr || "").includes("rm-ran");
   };
   const POSIX_SHELLS = process.platform === "win32"
@@ -908,6 +912,18 @@ describe("destructive reminder — shell context decides whether a word is a com
     for (const body of [...SUBSCRIPT_BODIES, "fix: don't break (#123)", "日本語 [note] é"]) {
       assert.equal(evaluatePermissionReminder("Bash", { command: messageWithBody(body) }), null, body);
     }
+  });
+
+  it("a backslash-newline inside the quoted message word is read the old way", () => {
+    // The shell removes it inside double quotes, so these are `$PWD[` again.
+    for (const open of ["$PWD\\\n[", "$PW\\\nD[", "$\\\nPWD["]) {
+      for (const body of SUBSCRIPT_BODIES) {
+        const command = messageAround(open, "]", body);
+        assert.deepEqual(evaluatePermissionReminder("Bash", { command }), { hold: true, tag: "file-delete" }, command);
+      }
+    }
+    // A backslash-newline elsewhere in the command does not matter.
+    assert.equal(evaluatePermissionReminder("Bash", { command: "git add a \\\n  b && " + messageWithBody("fix: x") }), null);
   });
 
   it("a message heredoc inside $(( )) or ${ } was already read the old way", () => {
