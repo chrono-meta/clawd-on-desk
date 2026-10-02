@@ -834,6 +834,19 @@
       return end + 1;
     }
 
+    // Inside double quotes a heredoc's output is still text, unless the
+    // expansion around it evaluates that text again. `$[ … ]` is arithmetic in
+    // bash and zsh, and in zsh `$name[ … ]` (also `$#name[`, `$@[`, `$$[` and
+    // so on) is a subscript evaluated the same way, so `a[$(rm …)]` in the body
+    // runs. Give up on any `$` that reaches a `[` through a parameter name, as
+    // the top level already does for `$[`. `$(( … ))` and `${ … }` give up in
+    // substitution() and skipParam().
+    const EVALUATED_SUBSCRIPT = /\$[#+=~^]*(?:[A-Za-z_][A-Za-z0-9_]*|[0-9]+|[*@#?$!-])?\[/y;
+    const evaluatedSubscriptAt = (i) => {
+      EVALUATED_SUBSCRIPT.lastIndex = i;
+      return EVALUATED_SUBSCRIPT.test(cmd);
+    };
+
     function skipDouble(i) {
       for (i++; i < cmd.length;) {
         const ch = cmd[i];
@@ -842,6 +855,7 @@
         else if (ch === "`") i = skipBacktick(i);
         else if (ch === "$" && cmd[i + 1] === "(") i = substitution(i);
         else if (ch === "$" && cmd[i + 1] === "{") i = skipParam(i);
+        else if (ch === "$" && evaluatedSubscriptAt(i)) giveUp();
         else i++;
       }
       return giveUp();

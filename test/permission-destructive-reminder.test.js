@@ -836,6 +836,101 @@ describe("destructive reminder — shell context decides whether a word is a com
     }
   });
 
+  // Inside the double quotes, an expansion around the heredoc can evaluate its
+  // output again: `$[ … ]` and `$(( … ))` are arithmetic, `${a[ … ]}` is a
+  // subscript, and in zsh so is `$name[ … ]`. Arithmetic evaluates a subscript
+  // in the text it is given, so `a[$(rm …)]` in the body runs.
+  const messageAround = (open, close, body) =>
+    "git commit -m \"" + open + "$(cat <<'EOF'\n" + body + "\nEOF\n)" + close + "\"";
+  const EVALUATING_WRAPPERS = [
+    ["$[", "]"],         // bash, sh, zsh (reported)
+    ["$[ 1 + ", " ]"],
+    ["x $[", "] y"],
+    ["$((", "))"],
+    ["${a[", "]}"],
+    ["$a[", "]"],        // zsh subscripts from here down
+    ["$PWD[", "]"],
+    ["$#a[", "]"],
+    ["$+a[", "]"],
+    ["$=a[", "]"],
+    ["$@[", "]"],
+    ["$$[", "]"],
+    ["$" + "v".repeat(80) + "[", "]"], // a long name
+  ];
+  // zsh only evaluates a subscript of a variable that is set, hence PATH.
+  const SUBSCRIPT_BODIES = ["a[$(rm -rf ./victim)]", "a[`rm -rf ./victim`]", "PATH[$(rm -rf ./victim)]"];
+
+  it("a message heredoc inside arithmetic or a subscript is read the old way", () => {
+    for (const [open, close] of EVALUATING_WRAPPERS) {
+      for (const body of SUBSCRIPT_BODIES) {
+        const command = messageAround(open, close, body);
+        assert.deepEqual(evaluatePermissionReminder("Bash", { command }), { hold: true, tag: "file-delete" }, command);
+      }
+    }
+    for (const command of [
+      "git commit --message=\"$[$(cat <<'EOF'\na[$(rm -rf ./victim)]\nEOF\n)]\"",
+      "gh pr create --title t --body \"$[$(cat <<'EOF'\na[$(rm -rf ./victim)]\nEOF\n)]\"",
+      "git commit -m ''\"$[$(cat <<'EOF'\na[$(rm -rf ./victim)]\nEOF\n)]\"",
+    ]) {
+      assert.deepEqual(evaluatePermissionReminder("Bash", { command }), { hold: true, tag: "file-delete" }, command);
+    }
+    // The same text as a plain message body is still message text.
+    for (const body of [...SUBSCRIPT_BODIES, "fix: don't break (#123)"]) {
+      assert.equal(evaluatePermissionReminder("Bash", { command: messageWithBody(body) }), null, body);
+    }
+  });
+
+  it("bash runs a heredoc's output inside $[ ], and the reminder holds it", {
+    skip: BASH3_SHELLS.length ? false : "needs bash 3.x at /bin/bash or /bin/sh (macOS)",
+  }, () => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "clawd-heredoc-"));
+    try {
+      // The reported command.
+      const reported = messageAround("$[", "]", "a[$(rm -rf ./victim)]");
+      for (const shell of BASH3_SHELLS) {
+        assert.equal(shellRunsRm(shell, reported, cwd), true, `${shell} evaluates a[$(rm …)] inside $[ ]`);
+        // Control: the same body as a plain message is not run.
+        assert.equal(shellRunsRm(shell, messageWithBody("a[$(rm -rf ./victim)]"), cwd), false, shell);
+      }
+      assert.deepEqual(evaluatePermissionReminder("Bash", { command: reported }), { hold: true, tag: "file-delete" });
+    } finally {
+      fs.rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("zsh runs a heredoc's output inside $name[ ], and the reminder holds it", {
+    skip: POSIX_SHELLS.includes("/bin/zsh") ? false : "needs /bin/zsh",
+  }, () => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "clawd-heredoc-"));
+    try {
+      const subscript = messageAround("$PWD[", "]", "PATH[$(rm -rf ./victim)]");
+      assert.equal(shellRunsRm("/bin/zsh", subscript, cwd), true, "zsh evaluates PATH[$(rm …)] inside $PWD[ ]");
+      assert.equal(shellRunsRm("/bin/zsh", messageWithBody("PATH[$(rm -rf ./victim)]"), cwd), false, "control");
+      assert.deepEqual(evaluatePermissionReminder("Bash", { command: subscript }), { hold: true, tag: "file-delete" });
+    } finally {
+      fs.rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("whenever a shell here runs the rm in arithmetic or a subscript, the reminder holds it", {
+    skip: POSIX_SHELLS.length ? false : "needs a POSIX shell",
+  }, () => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "clawd-heredoc-"));
+    try {
+      for (const [open, close] of EVALUATING_WRAPPERS) {
+        for (const body of SUBSCRIPT_BODIES) {
+          const command = messageAround(open, close, body);
+          const verdict = evaluatePermissionReminder("Bash", { command });
+          for (const shell of POSIX_SHELLS) {
+            if (shellRunsRm(shell, command, cwd)) assert.equal(verdict && verdict.hold, true, `${shell}: ${command}`);
+          }
+        }
+      }
+    } finally {
+      fs.rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
   it("a subshell is a command position", () => {
     // `echo safe; (rm -rf ./d)` left a segment starting with `(`, which the
     // anchored patterns cannot match while the shell runs the delete.
