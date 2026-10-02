@@ -793,7 +793,13 @@
     }
 
     // `i` is on `$(`; returns the index just past the substitution.
-    function substitution(i) {
+    // `doubleQuoted` says whether the `$(` sits directly inside double quotes.
+    // Only there is the substitution's output unconditionally data: at the top
+    // level an unquoted `$( … )` is field-split and globbed, and zsh's
+    // GLOB_SUBST can run the expanded text as a glob qualifier. Cut the body
+    // only inside double quotes; otherwise give up and read the command the old
+    // way, which scans the body.
+    function substitution(i, doubleQuoted) {
       const opener = MESSAGE_HEREDOC.exec(cmd.slice(i, i + 256));
       if (!opener) {
         const end = dollarSubstitutionEnd(cmd, i);
@@ -818,7 +824,10 @@
       }
       const close = /^[ \t\n]*\)/.exec(cmd.slice(pos));
       if (!close) giveUp();
-      if (isHeredocMessageSlot(words, word)) pending.push({ start: bodyStart, end: pos });
+      if (isHeredocMessageSlot(words, word)) {
+        if (doubleQuoted !== true) giveUp();
+        pending.push({ start: bodyStart, end: pos });
+      }
       return pos + close[0].length;
     }
 
@@ -861,7 +870,7 @@
         if (ch === "\\") i += 2;
         else if (ch === '"') return i + 1;
         else if (ch === "`") i = skipBacktick(i);
-        else if (ch === "$" && cmd[i + 1] === "(") i = substitution(i);
+        else if (ch === "$" && cmd[i + 1] === "(") i = substitution(i, true);
         else if (ch === "$" && cmd[i + 1] === "{") i = skipParam(i);
         else if (ch === "$" && evaluatedSubscriptAt(i)) giveUp();
         else i++;

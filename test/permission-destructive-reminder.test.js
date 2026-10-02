@@ -967,6 +967,66 @@ describe("destructive reminder — shell context decides whether a word is a com
     }
   });
 
+  // A `$( … )` at the top level is unquoted, so the shell word-splits and then
+  // globs its output. Under zsh's GLOB_SUBST that glob is a second evaluation:
+  // `*(e: … :)` runs the qualifier's code. The message-heredoc preprocessor may
+  // only treat the body as data when the substitution sits inside double
+  // quotes; unquoted it must read the command the old way and scan the body.
+  const UNQUOTED_MESSAGE_HEREDOC =
+    "git commit -m $(cat <<'EOF'\n*(e:\nrm -rf ./victim\n:)\nEOF\n)";
+  const QUOTED_MESSAGE_HEREDOC =
+    "git commit -m \"$(cat <<'EOF'\n*(e:\nrm -rf ./victim\n:)\nEOF\n)\"";
+
+  it("an unquoted message heredoc is scanned, not cut as message text", () => {
+    assert.deepEqual(
+      evaluatePermissionReminder("Bash", { command: UNQUOTED_MESSAGE_HEREDOC }),
+      { hold: true, tag: "file-delete" }
+    );
+    // Control: the same substitution inside double quotes is ordinary message
+    // text, so its dangerous-looking words are not a command.
+    assert.equal(evaluatePermissionReminder("Bash", { command: QUOTED_MESSAGE_HEREDOC }), null);
+    // And an unquoted message with nothing destructive stays silent: the fix
+    // reads the command the old way, it does not hold every unquoted heredoc.
+    assert.equal(
+      evaluatePermissionReminder("Bash", { command: "git commit -m $(cat <<'EOF'\nfix: harmless\nEOF\n)" }),
+      null
+    );
+  });
+
+  it("zsh GLOB_SUBST runs an unquoted message heredoc's output, and the reminder holds it", {
+    skip: POSIX_SHELLS.includes("/bin/zsh") ? false : "needs /bin/zsh",
+  }, () => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "clawd-heredoc-"));
+    // `e` runs once per glob match, so the pattern needs a file to match.
+    fs.writeFileSync(path.join(cwd, "seed.txt"), "");
+    const zshRunsRm = (command) => {
+      const script = SHELL_FAKES + "setopt GLOB_SUBST; IFS=''\n" + command;
+      const result = spawnSync("/bin/zsh", ["-f", "-c", script], {
+        cwd,
+        encoding: "utf8",
+        env: { PATH: "/usr/bin:/bin" },
+        timeout: 10000,
+      });
+      if (result.error) throw result.error;
+      if (result.signal) throw new Error(`/bin/zsh was killed by ${result.signal}`);
+      assert.equal(result.status, 0, `/bin/zsh failed: ${result.stderr}`);
+      return (result.stderr || "").includes("rm-ran");
+    };
+    try {
+      // Positive: the shell really runs the glob qualifier's code. The control
+      // below keeps this pair from passing vacuously if zsh never runs it.
+      assert.equal(zshRunsRm(UNQUOTED_MESSAGE_HEREDOC), true, "GLOB_SUBST evaluates an unquoted substitution's glob qualifier");
+      assert.equal(zshRunsRm(QUOTED_MESSAGE_HEREDOC), false, "double quotes keep the same bytes as data");
+      assert.deepEqual(
+        evaluatePermissionReminder("Bash", { command: UNQUOTED_MESSAGE_HEREDOC }),
+        { hold: true, tag: "file-delete" }
+      );
+      assert.equal(evaluatePermissionReminder("Bash", { command: QUOTED_MESSAGE_HEREDOC }), null);
+    } finally {
+      fs.rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
   it("zsh in a UTF-8 locale runs a heredoc's output inside a non-ASCII $name[ ], and the reminder holds it", {
     skip: ZSH_UTF8 ? false : "needs /bin/zsh with a working en_US.UTF-8 locale",
   }, () => {
